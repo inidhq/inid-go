@@ -39,6 +39,13 @@ func signingKey(t *testing.T) *rsa.PrivateKey {
 	return testKey
 }
 
+// set changes what the fake answers, under its lock (its server reads it from other goroutines)
+func (f *fakeInID) set(change func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	change()
+}
+
 type fakeInID struct {
 	t   *testing.T
 	srv *httptest.Server
@@ -289,7 +296,7 @@ func TestCallback(t *testing.T) {
 	f := newFake(t)
 	c := newClient(t, f)
 	_, fl, flowCookie := signIn(t, c, "return_to=/dashboard")
-	f.nextNonce = fl.Nonce
+	f.set(func() { f.nextNonce = fl.Nonce })
 	rec, _ := run(c, get("/api/inid/callback?code=c1&state="+fl.State, flowCookie, "__inid_out=1"))
 	check(t, "status", rec.Code, 302)
 	check(t, "to returnTo", rec.Header().Get("Location"), "/dashboard")
@@ -312,7 +319,7 @@ func TestCallback(t *testing.T) {
 
 	// A nonce that isn't this flow's: refused
 	_, fl, flowCookie = signIn(t, c, "return_to=/dashboard")
-	f.nextNonce = "someone-elses"
+	f.set(func() { f.nextNonce = "someone-elses" })
 	rec, _ = run(c, get("/api/inid/callback?code=c2&state="+fl.State, flowCookie))
 	check(t, "wrong nonce", rec.Code, 400)
 	check(t, "no session", setCookie(rec, "__inid_session"), "")
@@ -328,7 +335,7 @@ func TestCallbackEmbedded(t *testing.T) {
 	f := newFake(t)
 	c := newClient(t, f)
 	_, fl, flowCookie := signIn(t, c, "return_to=/a</script>&display=embed&page=/login")
-	f.nextNonce = fl.Nonce
+	f.set(func() { f.nextNonce = fl.Nonce })
 	rec, _ := run(c, get("/api/inid/callback?code=c1&state="+fl.State, flowCookie))
 	check(t, "status", rec.Code, 200)
 	check(t, "page", rec.Body.String(), `<!doctype html><meta charset="utf-8"><script>(window.top || window).location.replace("/a`+"\\"+"u003c"+`/script>")</script>`)
@@ -368,7 +375,7 @@ func TestRenewal(t *testing.T) {
 func TestRenewalRefused(t *testing.T) {
 	f := newFake(t)
 	c := newClient(t, f)
-	f.tokenStatus = 400
+	f.set(func() { f.tokenStatus = 400 })
 	rec, s := run(c, get("/", "__inid_session="+f.sign(f.claims(30)), "__inid_refresh=rt_old"))
 	check(t, "signed out", s.auth.IsSignedIn, false)
 	for _, name := range []string{"__inid_session", "__inid_refresh"} {
@@ -382,13 +389,13 @@ func TestRenewalRefused(t *testing.T) {
 func TestRenewalUnreachable(t *testing.T) {
 	f := newFake(t)
 	c := newClient(t, f)
-	f.tokenDown = true
+	f.set(func() { f.tokenDown = true })
 	rec, s := run(c, get("/", "__inid_session="+f.sign(f.claims(30)), "__inid_refresh=rt_old"))
 	check(t, "still valid stays", []any{s.auth.IsSignedIn, setCookie(rec, "__inid_session")}, []any{true, ""})
 	_, s = run(c, get("/", "__inid_session="+f.sign(f.claims(-5)), "__inid_refresh=rt_old"))
 	check(t, "expired doesn't", s.auth.IsSignedIn, false)
 
-	f.tokenDown, f.tokenStatus = false, 503
+	f.set(func() { f.tokenDown, f.tokenStatus = false, 503 })
 	_, s = run(c, get("/", "__inid_session="+f.sign(f.claims(30)), "__inid_refresh=rt_old"))
 	check(t, "5xx keeps", s.auth.IsSignedIn, true)
 }

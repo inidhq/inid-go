@@ -5,7 +5,7 @@ Sign-in with [InID](https://inid.co) for Go servers. People sign in with their p
 Standard library only. Works with `net/http`, chi, gorilla/mux, echo (via `echo.WrapMiddleware`) and anything else that takes an `http.Handler`.
 
 ```bash
-go get github.com/inid-co/inid-go
+go get github.com/inidhq/inid-go
 ```
 
 Set your keys from InID's panel (Settings → Keys):
@@ -27,7 +27,7 @@ import (
 	"log"
 	"net/http"
 
-	inid "github.com/inid-co/inid-go"
+	inid "github.com/inidhq/inid-go"
 )
 
 func main() {

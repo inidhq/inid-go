@@ -1,3 +1,3 @@
-module github.com/inid-co/inid-go
+module github.com/inidhq/inid-go
 
 go 1.22

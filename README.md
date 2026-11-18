@@ -52,9 +52,15 @@ func main() {
 }
 ```
 
-The middleware answers InID's routes under `/api/inid` (sign in, callback, sign out, session, sessions), renews the session before it ends, sends whoever isn't signed in from a protected path to sign in (and back), and answers `403` to someone signed in without the role or permission a rule asks for.
+The middleware answers InID's routes under `/api/inid` (sign in, callback, sign out, session, sessions, team, teams), renews the session before it ends, sends whoever isn't signed in from a protected path to sign in (and back), and answers `403` to someone signed in without the role, team role or permission a rule asks for.
 
-`inid.FromContext(ctx)` gives an `*inid.Auth`: `IsSignedIn`, `UserID`, `User` (`ID`, `FirstName`, `LastName`, `Name`, `Email`, `EmailVerified`, `Phone`, `Roles`, `Permissions`, `PublicMetadata`), `Session` (with the token's `Claims`) and `Has(inid.Check{Role: "admin"})` / `Has(inid.Check{Permission: "invoices:read"})`.
+`inid.FromContext(ctx)` gives an `*inid.Auth`: `IsSignedIn`, `UserID`, `User` (`ID`, `FirstName`, `LastName`, `Name`, `Email`, `EmailVerified`, `Phone`, `Roles`, `Permissions`, `PublicMetadata`, `Team`), `Session` (with the token's `Claims`) and `Has(inid.Check{Role: "admin"})` / `Has(inid.Check{Permission: "invoices:read"})` / `Has(inid.Check{TeamRole: "admin"})`. Every field set in a `Check` must hold; an empty one passes for anyone signed in.
+
+### Teams
+
+In apps with teams, `User.Team` is the person's active team (`*inid.Team`: `ID`, `Slug`, `Name`, `Role`, `Permissions`), or `nil` when they have none. `Check{TeamRole: "admin"}` checks their role in that team, and `Check{Permission: ...}` passes when the permission comes from their app role or from their team role. Rules take it too: `inid.Rule{Path: "/billing", TeamRole: "owner"}`.
+
+The browser components switch the active team with `POST /api/inid/team` (`{"teamId": "team_..."}`, or `null` for their own account): InID renews the session with that team and the answer is `{"user": ...}`. `/api/inid/teams/...` forwards the person's own team calls (list, create, members, invitations) to InID with the app's secret key.
 
 ## chi
 

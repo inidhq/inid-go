@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -62,6 +63,7 @@ type fakeInID struct {
 	revokeAuth  string
 	jwksHits    int
 	deleted     []string
+	teamCalls   [][]string // method, path, authorization, content type, body
 }
 
 func newFake(t *testing.T) *fakeInID {
@@ -102,6 +104,17 @@ func (f *fakeInID) serve(w http.ResponseWriter, r *http.Request) {
 		if f.nextNonce != "" {
 			claims["nonce"] = f.nextNonce
 		}
+		if r.PostForm.Has("team") {
+			switch r.PostForm.Get("team") {
+			case "":
+			case "t1":
+				claims["team"] = map[string]any{"id": "t1", "slug": "acme", "name": "Acme", "role": "admin", "permissions": []any{"invoices:write"}}
+			default:
+				w.WriteHeader(403)
+				_, _ = w.Write([]byte(`{"error":"not_a_member"}`))
+				return
+			}
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"id_token": f.sign(claims), "refresh_token": "rt_new", "access_token": "at", "expires_in": 600})
 	case r.URL.Path == "/oauth/revoke":
 		_ = r.ParseForm()
@@ -116,6 +129,22 @@ func (f *fakeInID) serve(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/v1/users/u1/sessions/") && r.Method == "DELETE":
 		f.deleted = append(f.deleted, strings.TrimPrefix(r.URL.Path, "/v1/users/u1/sessions/"))
 		_, _ = w.Write([]byte(`{"ended":1}`))
+	case strings.HasPrefix(r.URL.Path, "/v1/users/u1/teams"):
+		raw, _ := io.ReadAll(r.Body)
+		f.teamCalls = append(f.teamCalls, []string{r.Method, r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("Content-Type"), string(raw)})
+		switch {
+		case r.URL.Path == "/v1/users/u1/teams/boom":
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"error":"server_error"}`))
+		case r.URL.Path == "/v1/users/u1/teams" && r.Method == "POST":
+			w.WriteHeader(201)
+			_, _ = w.Write([]byte(`{"id":"t2"}`))
+		case r.URL.Path == "/v1/users/u1/teams":
+			_, _ = w.Write([]byte(`{"teams":[{"id":"t1"}]}`))
+		default:
+			w.WriteHeader(404)
+			_, _ = w.Write([]byte(`{"error":"not_found"}`))
+		}
 	default:
 		w.WriteHeader(404)
 	}
@@ -432,7 +461,7 @@ func TestSessionRoute(t *testing.T) {
 	var body map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &body)
 	user, _ := json.Marshal(body["user"])
-	check(t, "user", string(user), `{"email":"ana@correo.co","emailVerified":true,"firstName":"Ana","id":"u1","lastName":"Gómez","name":"Ana Gómez","permissions":["orders:read"],"phone":"+573001234567","publicMetadata":{"plan":"pro"},"roles":["staff"]}`)
+	check(t, "user", string(user), `{"email":"ana@correo.co","emailVerified":true,"firstName":"Ana","id":"u1","lastName":"Gómez","name":"Ana Gómez","permissions":["orders:read"],"phone":"+573001234567","publicMetadata":{"plan":"pro"},"roles":["staff"],"team":null}`)
 	check(t, "accountUrl", body["accountUrl"], f.srv.URL+"/account?client_id=pk_test_app")
 
 	rec, _ = run(c, get("/api/inid/session"))
@@ -443,7 +472,19 @@ func TestSessionRoute(t *testing.T) {
 	rec, _ = run(c, get("/api/inid/session", "__inid_session="+f.sign(bare)))
 	_ = json.Unmarshal(rec.Body.Bytes(), &body)
 	user, _ = json.Marshal(body["user"])
-	check(t, "bare user", string(user), `{"email":null,"emailVerified":false,"firstName":null,"id":"u2","lastName":null,"name":"Solo","permissions":[],"phone":null,"publicMetadata":{},"roles":[]}`)
+	check(t, "bare user", string(user), `{"email":null,"emailVerified":false,"firstName":null,"id":"u2","lastName":null,"name":"Solo","permissions":[],"phone":null,"publicMetadata":{},"roles":[],"team":null}`)
+
+	// The active team
+	withTeam := f.claims(600)
+	withTeam["team"] = map[string]any{"id": "t1", "slug": "acme", "name": "Acme", "role": "admin", "permissions": []any{"invoices:write", 3}}
+	rec, _ = run(c, get("/api/inid/session", "__inid_session="+f.sign(withTeam)))
+	var teamBody struct {
+		User struct {
+			Team json.RawMessage `json:"team"`
+		} `json:"user"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &teamBody)
+	check(t, "team", string(teamBody.User.Team), `{"id":"t1","slug":"acme","name":"Acme","role":"admin","permissions":["invoices:write"]}`)
 
 	// Renewal happens here too
 	rec, _ = run(c, get("/api/inid/session", "__inid_session="+f.sign(f.claims(10)), "__inid_refresh=rt"))
@@ -481,6 +522,133 @@ func TestSessionsRoute(t *testing.T) {
 	req.Header.Set("Cookie", cookie)
 	rec, _ = run(c, req)
 	check(t, "one", []any{strings.TrimSpace(rec.Body.String()), f.deleted[2]}, []any{`{"ended":1}`, "s9"})
+}
+
+// ---------- teams ----------
+
+func TestUserTeam(t *testing.T) {
+	u := userOf(map[string]any{
+		"sub": "u1", "roles": []any{"member"}, "permissions": []any{"invoices:read"},
+		"team": map[string]any{"id": "t1", "slug": "acme", "name": "Acme", "role": "admin", "permissions": []any{"invoices:write", 7}},
+	})
+	check(t, "team", *u.Team, Team{ID: "t1", Slug: "acme", Name: "Acme", Role: "admin", Permissions: []string{"invoices:write"}})
+	check(t, "team role", []bool{u.Has(Check{TeamRole: "admin"}), u.Has(Check{TeamRole: "member"})}, []bool{true, false})
+	check(t, "permission from the team or the app role", []bool{
+		u.Has(Check{Permission: "invoices:write"}), u.Has(Check{Permission: "invoices:read"}), u.Has(Check{Permission: "billing:write"}),
+	}, []bool{true, true, false})
+	check(t, "all must hold", []bool{
+		u.Has(Check{Role: "member", TeamRole: "admin", Permission: "invoices:write"}), u.Has(Check{Role: "admin", TeamRole: "admin"}),
+	}, []bool{true, false})
+
+	for name, claim := range map[string]any{
+		"missing": nil, "no role": map[string]any{"id": "t1"}, "id not a string": map[string]any{"id": 1, "role": "admin"}, "a list": []any{"t1"},
+	} {
+		claims := map[string]any{"sub": "u1", "permissions": []any{"a"}}
+		if claim != nil {
+			claims["team"] = claim
+		}
+		u := userOf(claims)
+		if u.Team != nil {
+			t.Errorf("%s: team should be nil, got %+v", name, u.Team)
+		}
+		check(t, name+": no team role, app permission still counts", []bool{u.Has(Check{TeamRole: "admin"}), u.Has(Check{Permission: "a"})}, []bool{false, true})
+	}
+	bare := userOf(map[string]any{"sub": "u1", "team": map[string]any{"id": "t", "role": "viewer", "slug": 3, "permissions": "x"}})
+	raw, _ := json.Marshal(bare.Team)
+	check(t, "bare team", string(raw), `{"id":"t","slug":"","name":"","role":"viewer","permissions":[]}`)
+	var nobody *User
+	check(t, "signed out", nobody.Has(Check{TeamRole: "admin"}), false)
+
+	f := newFake(t)
+	c := newClient(t, f)
+	protect := Protect(Rule{Path: "/team-admin", TeamRole: "admin"}, Rule{Path: "/team-owner", TeamRole: "owner"})
+	withTeam := f.claims(600)
+	withTeam["team"] = map[string]any{"id": "t1", "role": "admin"}
+	rec, _ := run(c, get("/team-admin", "__inid_session="+f.sign(f.claims(600))), protect)
+	check(t, "rule without a team", rec.Code, 403)
+	rec, _ = run(c, get("/team-admin", "__inid_session="+f.sign(withTeam)), protect)
+	check(t, "rule with the team role", rec.Code, 200)
+	rec, _ = run(c, get("/team-owner", "__inid_session="+f.sign(withTeam)), protect)
+	check(t, "rule with another team role", rec.Code, 403)
+}
+
+func post(path, body string, cookies ...string) *http.Request {
+	r := httptest.NewRequest("POST", "https://app.example"+path, strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	if len(cookies) > 0 {
+		r.Header.Set("Cookie", strings.Join(cookies, "; "))
+	}
+	return r
+}
+
+func TestTeamRoute(t *testing.T) {
+	f := newFake(t)
+	c := newClient(t, f)
+	rec, _ := run(c, post("/api/inid/team", `{"teamId":"t1"}`))
+	check(t, "anonymous", []any{rec.Code, strings.TrimSpace(rec.Body.String())}, []any{401, `{"error":"not_signed_in"}`})
+	cookies := []string{"__inid_session=" + f.sign(f.claims(600)), "__inid_refresh=rt_1"}
+
+	rec, _ = run(c, post("/api/inid/team", `{"teamId":"t1"}`, cookies...))
+	var body struct {
+		User *User `json:"user"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	check(t, "switched", []any{rec.Code, body.User.Team.ID, body.User.Team.Role}, []any{200, "t1", "admin"})
+	form := f.tokenForms[len(f.tokenForms)-1]
+	check(t, "token form", []string{form.Get("grant_type"), form.Get("refresh_token"), form.Get("team")}, []string{"refresh_token", "rt_1", "t1"})
+	check(t, "basic auth", strings.HasPrefix(f.tokenAuth[len(f.tokenAuth)-1], "Basic "), true)
+	if !strings.HasPrefix(setCookie(rec, "__inid_refresh"), "__inid_refresh=rt_new;") || setCookie(rec, "__inid_session") == "" {
+		t.Error("the session cookies weren't set again")
+	}
+
+	rec, _ = run(c, post("/api/inid/team", `{"teamId":null}`, cookies...))
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	form = f.tokenForms[len(f.tokenForms)-1]
+	check(t, "own account", []any{rec.Code, body.User.Team == nil, form.Has("team"), form.Get("team")}, []any{200, true, true, ""})
+
+	rec, _ = run(c, post("/api/inid/team", `{"teamId":"t9"}`, cookies...))
+	check(t, "not a member", []any{rec.Code, strings.TrimSpace(rec.Body.String()), len(rec.Result().Header.Values("Set-Cookie"))}, []any{400, `{"error":"not_a_member"}`, 0})
+	rec, _ = run(c, post("/api/inid/team", `{"teamId":5}`, cookies...))
+	check(t, "bad teamId", rec.Code, 400)
+
+	f.set(func() { f.tokenStatus = 400 })
+	rec, _ = run(c, post("/api/inid/team", `{"teamId":"t1"}`, cookies...))
+	check(t, "session over", []any{rec.Code, strings.TrimSpace(rec.Body.String())}, []any{401, `{"error":"not_signed_in"}`})
+	if !strings.Contains(setCookie(rec, "__inid_session"), "Max-Age=0") {
+		t.Error("cookies weren't cleared")
+	}
+}
+
+func TestTeamsForwarder(t *testing.T) {
+	f := newFake(t)
+	c := newClient(t, f)
+	rec, _ := run(c, get("/api/inid/teams"))
+	check(t, "anonymous", rec.Code, 401)
+	cookie := "__inid_session=" + f.sign(f.claims(600))
+
+	rec, _ = run(c, get("/api/inid/teams", cookie))
+	check(t, "list", []any{rec.Code, rec.Body.String()}, []any{200, `{"teams":[{"id":"t1"}]}`})
+	check(t, "list call", f.teamCalls[0], []string{"GET", "/v1/users/u1/teams", "Bearer sk_test_secret", "", ""})
+	rec, _ = run(c, post("/api/inid/teams", `{"name":"Beta"}`, cookie))
+	check(t, "create", []any{rec.Code, rec.Body.String()}, []any{201, `{"id":"t2"}`})
+	check(t, "create call", f.teamCalls[1], []string{"POST", "/v1/users/u1/teams", "Bearer sk_test_secret", "application/json", `{"name":"Beta"}`})
+	req := httptest.NewRequest("DELETE", "https://app.example/api/inid/teams/t1/members/m1", nil)
+	req.Header.Set("Cookie", cookie)
+	rec, _ = run(c, req)
+	check(t, "InID's 404 passed on", []any{rec.Code, f.teamCalls[2][0], f.teamCalls[2][1]}, []any{404, "DELETE", "/v1/users/u1/teams/t1/members/m1"})
+	rec, _ = run(c, get("/api/inid/teams/boom", cookie))
+	check(t, "5xx", rec.Code, 502)
+
+	calls := len(f.teamCalls)
+	for _, path := range []string{"/api/inid/teams/a/b/c/d/e", "/api/inid/teams/a.b", "/api/inid/teams/"} {
+		rec, _ = run(c, get(path, cookie))
+		check(t, path, rec.Code, 404)
+	}
+	req = httptest.NewRequest("PUT", "https://app.example/api/inid/teams", nil)
+	req.Header.Set("Cookie", cookie)
+	rec, _ = run(c, req)
+	check(t, "PUT", rec.Code, 404)
+	check(t, "nothing forwarded", len(f.teamCalls), calls)
 }
 
 // ---------- 6. the gate ----------

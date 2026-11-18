@@ -8,8 +8,8 @@ import (
 	"strings"
 )
 
-// Rule is a path (or pattern) that needs someone signed in, and optionally a role or a
-// permission. Entrance is the door its sign-in goes through (an entrance key from the panel).
+// Rule is a path (or pattern) that needs someone signed in, and optionally a role, a team
+// role or a permission. Entrance is the door its sign-in goes through (an entrance key from the panel).
 //
 //	inid.Path("/dashboard")
 //	inid.Regex(`^/reports/\d+$`)
@@ -22,6 +22,8 @@ type Rule struct {
 	Role       string
 	Permission string
 	Entrance   string
+	// A role in the person's active team (apps with teams)
+	TeamRole string
 }
 
 // Path is a rule for a path and its subpaths.
@@ -144,8 +146,8 @@ func (c *Client) Middleware(next http.Handler, opts ...Option) http.Handler {
 		}
 		if res.session != nil {
 			for _, rule := range matched {
-				// Signed in, without the role or permission the path needs
-				if !res.session.User.Has(Check{Role: rule.Role, Permission: rule.Permission}) {
+				// Signed in, without the role, team role or permission the path needs
+				if !res.session.User.Has(Check{Role: rule.Role, Permission: rule.Permission, TeamRole: rule.TeamRole}) {
 					w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 					w.WriteHeader(http.StatusForbidden)
 					_, _ = w.Write([]byte("Forbidden"))

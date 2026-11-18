@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -16,6 +17,7 @@ import (
 var (
 	safePath  = regexp.MustCompile(`^/[^/\\]`)
 	stateName = regexp.MustCompile(`^[\w-]{1,64}$`)
+	teamsRest = regexp.MustCompile(`^(/[\w-]{1,80}){0,4}$`)
 )
 
 // safeReturn keeps a path in the app itself, never another site.
@@ -36,7 +38,7 @@ type flow struct {
 }
 
 // Handler answers the routes under the api path (signin, callback, signout, session,
-// sessions). Mount it at the api path: mux.Handle("/api/inid/", client.Handler()).
+// sessions, team, teams). Mount it at the api path: mux.Handle("/api/inid/", client.Handler()).
 // Middleware answers them too, so mounting it is only needed without the middleware.
 func (c *Client) Handler() http.Handler {
 	return http.HandlerFunc(c.serveRoutes)
@@ -92,6 +94,10 @@ func (c *Client) serveRoutes(w http.ResponseWriter, r *http.Request) {
 		c.signOut(w, r)
 	case action == "sessions" || strings.HasPrefix(action, "sessions/"):
 		c.sessions(w, r, action)
+	case r.Method == "POST" && action == "team":
+		c.switchTeam(w, r)
+	case action == "teams" || strings.HasPrefix(action, "teams/"):
+		c.teams(w, r, action)
 	case r.Method == "GET" && action == "session":
 		secure := c.secure(r)
 		res, err := c.readSession(r, true, secure)
@@ -260,6 +266,116 @@ func (c *Client) signOut(w http.ResponseWriter, r *http.Request) {
 	addCookies(w, clearCookies(secure))
 	addCookies(w, []string{cookie(cookieOut, "1", cookieMaxAge, "/", secure)})
 	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// switchTeam sets the person's active team: POST team {"teamId"} (null: their own account).
+// InID renews the session with it, so the new cookies (and this answer) say the team.
+func (c *Client) switchTeam(w http.ResponseWriter, r *http.Request) {
+	secure := c.secure(r)
+	jar := parseCookies(r)
+	res, err := c.readSession(r, false, secure)
+	if err != nil || res.session == nil || jar[cookieRefresh] == "" {
+		writeJSON(w, 401, map[string]string{"error": "not_signed_in"})
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body)
+	team := ""
+	switch asked := body["teamId"].(type) {
+	case nil:
+	case string:
+		team = asked
+	default:
+		writeJSON(w, 400, map[string]string{"error": "invalid_request"})
+		return
+	}
+	t, err := c.token(r.Context(), url.Values{"grant_type": {"refresh_token"}, "refresh_token": {jar[cookieRefresh]}, "team": {team}})
+	var renewed *verified
+	if err == nil {
+		renewed, err = c.verifyIDToken(t.IDToken, "", false)
+		if err == nil && renewed == nil {
+			err = &Error{Code: "invalid_id_token", Status: 400}
+		}
+	}
+	if err != nil {
+		var ie *Error
+		if !errors.As(err, &ie) {
+			writeJSON(w, 502, map[string]string{"error": "inid_unavailable"})
+			return
+		}
+		// The session itself is over; anything else (a team they aren't in) leaves it as it was
+		if ie.Code == "invalid_grant" {
+			addCookies(w, clearCookies(secure))
+			writeJSON(w, 401, map[string]string{"error": "not_signed_in"})
+			return
+		}
+		status := 502
+		if ie.Status > 0 && ie.Status < 500 {
+			status = 400
+		}
+		writeJSON(w, status, map[string]string{"error": ie.Code})
+		return
+	}
+	addCookies(w, sessionCookies(t, secure))
+	writeJSON(w, 200, map[string]any{"user": userOf(renewed.claims)})
+}
+
+// teams forwards the person's own team calls through the app's server (InID checks what their
+// team role lets them do): teams, teams/{id}, teams/{id}/members… → /v1/users/{sub}/teams…
+func (c *Client) teams(w http.ResponseWriter, r *http.Request, action string) {
+	res, err := c.readSession(r, false, c.secure(r))
+	if err != nil || res.session == nil {
+		writeJSON(w, 401, map[string]string{"error": "not_signed_in"})
+		return
+	}
+	rest := action[len("teams"):]
+	switch r.Method {
+	case "GET", "POST", "PATCH", "DELETE":
+	default:
+		writeJSON(w, 404, map[string]string{"error": "not_found"})
+		return
+	}
+	if !teamsRest.MatchString(rest) {
+		writeJSON(w, 404, map[string]string{"error": "not_found"})
+		return
+	}
+	var body io.Reader
+	if r.Method == "POST" || r.Method == "PATCH" {
+		raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if len(raw) > 0 {
+			body = bytes.NewReader(raw)
+		}
+	}
+	target := c.cfg.Issuer + "/v1/users/" + url.PathEscape(res.session.User.ID) + "/teams" + rest
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, body)
+	if err != nil {
+		writeJSON(w, 502, map[string]string{"error": "teams_unavailable"})
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+c.cfg.SecretKey)
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	answer, err := c.http.Do(req)
+	if err != nil {
+		writeJSON(w, 502, map[string]string{"error": "teams_unavailable"})
+		return
+	}
+	defer answer.Body.Close()
+	raw, _ := io.ReadAll(answer.Body)
+	status := answer.StatusCode
+	if status >= 500 {
+		status = 502
+	}
+	if !json.Valid(raw) {
+		writeJSON(w, status, map[string]string{"error": "teams_unavailable"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_, _ = w.Write(raw)
 }
 
 // sessions lists the person's sessions at this app, or ends one (sessions/{id}) or all but

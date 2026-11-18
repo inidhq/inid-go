@@ -17,16 +17,29 @@ type User struct {
 	Roles          []string       `json:"roles"`
 	Permissions    []string       `json:"permissions"`
 	PublicMetadata map[string]any `json:"publicMetadata"`
+	// The team they're working in now (apps with teams), with their role there; nil: none
+	Team *Team `json:"team"`
 }
 
-// Check asks for a role, a permission, or both.
+// Team is the person's active team, chosen per session: their role there and what it allows.
+type Team struct {
+	ID          string   `json:"id"`
+	Slug        string   `json:"slug"`
+	Name        string   `json:"name"`
+	Role        string   `json:"role"`
+	Permissions []string `json:"permissions"`
+}
+
+// Check asks for a role, a role in the active team, a permission, or several of them.
 type Check struct {
 	Role       string
 	Permission string
+	TeamRole   string
 }
 
-// Has is true when the user has the role and/or permission asked (both, if both are asked).
-// With neither, any signed-in user passes: a protect rule with only a path needs no role.
+// Has is true when the user has everything asked: the role, the role in their active team,
+// the permission (from their app role or their team role). With nothing asked, any signed-in
+// user passes: a protect rule with only a path needs no role.
 func (u *User) Has(check Check) bool {
 	if u == nil {
 		return false
@@ -34,7 +47,11 @@ func (u *User) Has(check Check) bool {
 	if check.Role != "" && !slices.Contains(u.Roles, check.Role) {
 		return false
 	}
-	if check.Permission != "" && !slices.Contains(u.Permissions, check.Permission) {
+	if check.TeamRole != "" && (u.Team == nil || u.Team.Role != check.TeamRole) {
+		return false
+	}
+	if check.Permission != "" && !slices.Contains(u.Permissions, check.Permission) &&
+		(u.Team == nil || !slices.Contains(u.Team.Permissions, check.Permission)) {
 		return false
 	}
 	return true
@@ -76,17 +93,6 @@ func userOf(claims map[string]any) *User {
 		}
 		return nil
 	}
-	strs := func(key string) []string {
-		out := []string{}
-		if list, ok := claims[key].([]any); ok {
-			for _, v := range list {
-				if s, ok := v.(string); ok {
-					out = append(out, s)
-				}
-			}
-		}
-		return out
-	}
 	sub, _ := claims["sub"].(string)
 	u := &User{
 		ID:          sub,
@@ -94,8 +100,9 @@ func userOf(claims map[string]any) *User {
 		LastName:    text("family_name"),
 		Email:       text("email"),
 		Phone:       text("phone_number"),
-		Roles:       strs("roles"),
-		Permissions: strs("permissions"),
+		Roles:       stringsOf(claims["roles"]),
+		Permissions: stringsOf(claims["permissions"]),
+		Team:        teamOf(claims["team"]),
 	}
 	u.EmailVerified, _ = claims["email_verified"].(bool)
 	var parts []string
@@ -119,4 +126,33 @@ func userOf(claims map[string]any) *User {
 		u.PublicMetadata = map[string]any{}
 	}
 	return u
+}
+
+// stringsOf keeps the strings of a JSON list; empty (never nil) otherwise.
+func stringsOf(v any) []string {
+	out := []string{}
+	if list, ok := v.([]any); ok {
+		for _, item := range list {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+// teamOf is the ID token's team claim; nil when it's missing or malformed.
+func teamOf(claim any) *Team {
+	t, ok := claim.(map[string]any)
+	if !ok {
+		return nil
+	}
+	id, okID := t["id"].(string)
+	role, okRole := t["role"].(string)
+	if !okID || !okRole {
+		return nil
+	}
+	slug, _ := t["slug"].(string)
+	name, _ := t["name"].(string)
+	return &Team{ID: id, Slug: slug, Name: name, Role: role, Permissions: stringsOf(t["permissions"])}
 }
